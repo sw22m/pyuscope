@@ -3,6 +3,7 @@ from uscope.app.argus.input_widget import InputWidget
 from uscope.config import get_data_dir, get_bc
 from uscope.motion import motion_util
 from uscope.microscope import StopEvent, MicroscopeStop
+from uscope.util import readj, writej
 
 from PyQt5 import Qt
 from PyQt5.QtGui import *
@@ -115,28 +116,65 @@ class ArgusScriptingPlugin(QThread):
         try:
             with StopEvent(self._ac.microscope) as self.se:
                 self.run_test()
+                self.wrap_cleanup("Done. Running cleanup")
             self._succeeded = True
+        except TestFailed:
+            self.wrap_cleanup("Failed. Running cleanup")
+            self._succeeded = False
+            self.result_message = "Failed"
+        # Test stopped but not microscope
         except TestAborted:
+            self.wrap_cleanup("Aborted. Running cleanup")
             self._succeeded = False
             self.result_message = "Aborted"
+        # Full microscope stop
+        # Closer to estop
+        # Don't clean up
         except MicroscopeStop:
             self._succeeded = False
             self.result_message = "Aborted"
-        except TestFailed:
-            self._succeeded = False
-            self.result_message = "Failed"
+        # Test unstable and force killed
+        # Unstable, don't attempt cleanup
         except TestKilled:
             self._succeeded = False
             self.result_message = "killed"
+        # Generic test crash
+        # Try to cleanup if possible
         except Exception as e:
+            self.wrap_cleanup("Exception. Running cleanup")
             self._succeeded = False
             self.result_message = f"Exception: {e}"
+            print("")
+            print("Script generated unhandled exception")
+            traceback.print_exc()
+        # file exceptions can cause this
+        # XXX: actually I think this was camera disconnect
+        except OSError as e:
+            self.wrap_cleanup("OSError. Running cleanup")
+            self._succeeded = False
+            self.result_message = f"Exception (OSError): {e}"
             print("")
             print("Script generated unhandled exception")
             traceback.print_exc()
         finally:
             self._running.clear()
             self.done.emit()
+
+    def wrap_cleanup(self, msg):
+        try:
+            self._running.set()
+            self.log(msg)
+            try:
+                self.cleanup()
+            except Exception as e:
+                self.log("Script generated unhandled exception in cleanup")
+                print("Script generated unhandled exception in cleanup")
+                traceback.print_exc()
+        finally:
+            self._running.clear()
+
+    def cleanup(self):
+        pass
 
     """
     Main API
@@ -249,6 +287,9 @@ class ArgusScriptingPlugin(QThread):
         """
         return self._ac.microscope.objectives.get_full_config()
 
+    def get_objective_config(self):
+        return self.get_objectives_config()[self.get_active_objective()]
+
     def get_active_objective(self):
         """
         Returns the name of the active objective
@@ -260,6 +301,20 @@ class ArgusScriptingPlugin(QThread):
         Check if name is in cache
         """
         self._ac.mainTab.objective_widget.setObjective.emit(objective)
+
+    def microscope_model(self):
+        """
+        Config file name
+        Will always return something
+        """
+        return self._ac.microscope.model()
+
+    def microscope_serial(self):
+        """
+        From GRBL
+        May not be present and return None
+        """
+        return self._ac.microscope.serial()
 
     """
     Advanced API
@@ -379,7 +434,7 @@ class ScriptingTab(ArgusTab):
         layout.addWidget(QHLine(), row, 0)
         row += 1
 
-        self.fn_le = QLineEdit("")
+        self.fn_le = QLineEdit("No file selected")
         layout.addWidget(self.fn_le, row, 0)
         row += 1
         self.fn_le.setReadOnly(True)
@@ -416,6 +471,24 @@ class ScriptingTab(ArgusTab):
         layout.addWidget(self.kill_pb, row, 0)
         row += 1
 
+        def load_save_layout():
+            layout = QHBoxLayout()
+
+            self.load_config_pb = QPushButton("Load config")
+            self.load_config_pb.setEnabled(False)
+            self.load_config_pb.clicked.connect(self.load_config_pb_clicked)
+            layout.addWidget(self.load_config_pb)
+
+            self.save_config_pb = QPushButton("Save config")
+            self.save_config_pb.setEnabled(False)
+            self.save_config_pb.clicked.connect(self.save_config_pb_clicked)
+            layout.addWidget(self.save_config_pb)
+
+            return layout
+
+        layout.addLayout(load_save_layout(), row, 0)
+        row += 1
+
         self.input = InputWidget(clicked=self.inputWidgetClicked)
         layout.addWidget(self.input, row, 0)
         row += 1
@@ -433,6 +506,14 @@ class ScriptingTab(ArgusTab):
         row += 1
 
         self.setLayout(layout)
+
+        # Most users don't need this
+        # TODO: make this a menu item
+        self.enable_advanced_scripting(get_bc().dev_mode())
+
+    def enable_advanced_scripting(self, enabled):
+        self.reload_pb.setVisible(enabled)
+        self.kill_pb.setVisible(enabled)
 
     def browse_for_script(self, name):
         directory = self.script_dirs[name]
@@ -470,6 +551,8 @@ class ScriptingTab(ArgusTab):
 
             self.status_le.setText("Status: idle")
             self.run_pb.setEnabled(True)
+            self.save_config_pb.setEnabled(True)
+            self.load_config_pb.setEnabled(True)
             self.run_pb.setVisible(self.plugin.show_run_button())
 
             # self.test_name_cb.clear()
@@ -509,6 +592,8 @@ class ScriptingTab(ArgusTab):
         self.reload_pb.setEnabled(False)
         self.stop_pb.setEnabled(True)
         self.kill_pb.setEnabled(True)
+        self.save_config_pb.setEnabled(False)
+        self.save_config_pb.setEnabled(False)
         self.log_local("Plugin loading")
         self.plugin.reset()
         self.plugin.start()
@@ -543,6 +628,44 @@ class ScriptingTab(ArgusTab):
                 ctypes.c_long(thread_id), 0)
             self.log_local("Exception raise failure")
 
+    def default_config_file_name(self):
+        # /home/mcmaster/script/my_script.py => my_script.json
+        return os.path.basename(str(
+            self.fn_le.text())).split(".")[0] + ".script.json"
+
+    def load_config_pb_clicked(self):
+        directory = self.ac.bc.script_data_dir()
+        directory = os.path.join(directory, self.default_config_file_name())
+        filename = QFileDialog.getOpenFileName(None,
+                                               "Select input script config",
+                                               directory,
+                                               "Script config (*.json *.j5)")
+        if not filename:
+            return
+        filename = str(filename[0])
+        if not filename:
+            return
+        try:
+            j = readj(filename)
+            self.input.setValue(j)
+        except Exception as e:
+            self.log_local(f"Failed to load script config: {type(e)}: {e}")
+            traceback.print_exc()
+
+    def save_config_pb_clicked(self):
+        directory = self.ac.bc.script_data_dir()
+        directory = os.path.join(directory, self.default_config_file_name())
+        filename = QFileDialog.getSaveFileName(None,
+                                               "Select output script config",
+                                               directory,
+                                               "Script config (*.json *.j5)")
+        if not filename:
+            return
+        filename = str(filename[0])
+
+        j = self.input.getValue()
+        writej(filename, j)
+
     def plugin_done(self):
         if self.plugin.succeeded():
             status = "Status: finished ok"
@@ -558,6 +681,8 @@ class ScriptingTab(ArgusTab):
         self.stop_pb.setEnabled(False)
         self.kill_pb.setEnabled(False)
         self.reload_pb.setEnabled(True)
+        self.save_config_pb.setEnabled(True)
+        self.save_config_pb.setEnabled(True)
         if self.plugin.succeeded():
             self.log_local("Plugin completed ok")
         else:

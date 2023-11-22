@@ -5,6 +5,8 @@ from collections import OrderedDict
 from uscope.util import writej, readj
 from pathlib import Path
 from uscope import jsond
+import shutil
+import subprocess
 '''
 There is a config directory with two primary config files:
 -microscope.j5: inherent config that doesn't really change
@@ -48,6 +50,36 @@ default_microscope_name_cache = None
 Calibration broken out into separate file to allow for easier/safer frequent updates
 Ideally we'd also match on S/N or something like that
 """
+
+
+def find_panotools_exe(config, configk, exe_name, flatpak_name):
+    exe = config.get(configk)
+    if exe is not None:
+        return tuple(exe)
+
+    if 1:
+        exe = shutil.which(exe_name)
+        if exe is not None:
+            return (exe, )
+
+    # flatpak run --command=enfuse net.sourceforge.Hugin --help
+    # bwrap: execvp align_image_stackD: No such file or directory
+    # bad command => returns 1
+    # good command => returns 0
+    command = [
+        "flatpak", "run", f"--command={flatpak_name}", "net.sourceforge.Hugin",
+        "--help"
+    ]
+    process = subprocess.Popen(command,
+                               stderr=subprocess.PIPE,
+                               stdout=subprocess.PIPE)
+    _stdout, _stderr = process.communicate()
+    exit_code = process.wait()
+    if exit_code == 0:
+        return ("flatpak", "run",
+                f"--command={flatpak_name} net.sourceforge.Hugin")
+
+    return None
 
 
 class SystemNotFound(Exception):
@@ -157,9 +189,23 @@ class USCImager:
     def source(self):
         return self.j.get("source", "auto")
 
+    def native_wh(self):
+        """
+        The largest possible sensor resolution
+        Following are not applied yet: crop, scaling
+        """
+        try:
+            w = int(self.j['native_width'])
+            h = int(self.j['native_height'])
+        except KeyError:
+            raise Exception(
+                "can't compute um_per_pixel_raw_1x: not specified and missing native_width/height"
+            )
+        return w, h
+
     def raw_wh(self):
         """
-        The actual sensor size
+        The selected sensor size before any processing
         Following are not applied yet: crop, scaling
         """
         w = int(self.j['width'])
@@ -517,7 +563,26 @@ class USCMotion:
             return bool(v)
 
     def axes(self):
+        """
+        Some systems don't use all axes
+        Ex: system might just be XY with Z N/C
+        """
         return set(self.j.get("axes", "xyz"))
+
+    def damper(self):
+        """
+        Turn down acceleration and velocity
+        Hack to slow down a system that's too aggressive
+        Typically used when samples aren't fixtured down well enough
+        Otherwise you can jog slower but scan G0 will be too aggressive
+
+        WARNING: assumes you are configuring velocity / acceleration at startup
+        Otherwise will "compound" each time you start up
+        """
+        ret = self.j.get("damper", None)
+        if ret is not None:
+            assert 0 < ret <= 1.0
+        return ret
 
 
 class USCPlanner:
@@ -592,11 +657,35 @@ class USCKinematics:
 
 
 class USCOptics:
-    def __init__(self, j=None):
+    def __init__(self, j=None, usc=None):
         self.j = j
+        self.usc = usc
+
+    def image_wh_1x_mm(self):
+        """
+        1x "objective", not 1x magnification on sensor
+        Relay, barlow, etc lens may significantly alter this from actual sensor size
+        """
+        return self.j.get("image_width_1x_mm"), self.j.get(
+            "image_height_1x_mm")
 
     def um_per_pixel_raw_1x(self):
-        return self.j.get("um_per_pixel_raw_1x", None)
+        """
+        1x "objective", not 1x magnification on sensor
+        Relay, barlow, etc lens may significantly alter this from actual pixel size
+        """
+        # Directly specified?
+        ret = self.j.get("um_per_pixel_raw_1x", None)
+        if ret is not None:
+            return ret
+        # Fallback to calculating based on resolution
+        native_w_pix, _native_h_pix = self.usc.imager.native_wh()
+        this_w_pix, _this_h_pix = self.usc.imager.raw_wh()
+        w_mm, _h_mm = self.image_wh_1x_mm()
+        # Less resolution => larger pixel
+        ratio = native_w_pix / this_w_pix
+        native_um_per_pixel_raw_1x = w_mm / native_w_pix * 1000
+        return native_um_per_pixel_raw_1x * ratio
 
     def diffusion(self):
         """
@@ -718,7 +807,7 @@ class USC:
         self.motion = USCMotion(self.usj.get("motion"))
         self.planner = USCPlanner(self.usj.get("planner", {}))
         self.kinematics = USCKinematics(self.usj.get("kinematics", {}))
-        self.optics = USCOptics(self.usj.get("optics", {}))
+        self.optics = USCOptics(self.usj.get("optics", {}), usc=self)
         self.ipp = USCImageProcessingPipeline(self.usj.get("ipp", {}))
         self.apps = {}
         self.bc = get_bc()
@@ -1114,6 +1203,29 @@ class BaseConfig:
         self.objective_db = ObjectiveDB()
         # self.joystick = JoystickConfig(jbc=self.j.get("joystick", {}))
 
+        self._enblend_cli = None
+        self._enfuse_cli = None
+        self._align_image_stack_cli = None
+
+    def batch_data_dir(self, mkdir=True):
+        """
+        Directory holding saved batch scans
+        Note: this doesn't include the "working" state saved in the GUI
+        """
+        ret = os.path.join(get_data_dir(mkdir=mkdir), "batch")
+        if not os.path.exists(ret) and mkdir:
+            os.mkdir(ret)
+        return ret
+
+    def script_data_dir(self, mkdir=True):
+        """
+        Directory holding saved script parameters
+        """
+        ret = os.path.join(get_data_dir(mkdir=mkdir), "script")
+        if not os.path.exists(ret) and mkdir:
+            os.mkdir(ret)
+        return ret
+
     def labsmore_stitch_use_xyfstitch(self):
         """
         xyfstitch is the newer higher fidelity stitch engine
@@ -1121,6 +1233,13 @@ class BaseConfig:
         and uses a very different algorithm to stitch vs stock
         """
         return bool(self.j.get("labsmore_stitch", {}).get("use_xyfstitch"))
+
+    def labsmore_stitch_save_cloudshare(self):
+        """
+        If this setting is true, then tell the sticher to copy
+        the generated zoomable files to the served cloudshare bucket.
+        """
+        return bool(self.j.get("labsmore_stitch", {}).get("cloudshare"))
 
     def labsmore_stitch_aws_access_key(self):
         return self.j.get("labsmore_stitch", {}).get("aws_access_key")
@@ -1166,6 +1285,60 @@ class BaseConfig:
             if system["guid"] == guid:
                 return system
         return None
+
+    def write_html_viewer(self):
+        """
+        Write a simple .html file at the final image level
+        Its not so much stitched as plastered together
+        """
+        # Very little disk space, easy to distinguish from other image files
+        # Turn on by default
+        return bool(self.j.get("ipp", {}).get("write_html_viewer", True))
+
+    def write_summary_image(self):
+        """
+        Write a simple combined image file at the final image level
+        Its not so much stitched as plastered together
+        """
+        # This takes up disk space => off by default
+        return bool(self.j.get("ipp", {}).get("write_summary_image", False))
+
+    def check_panotools(self):
+        """
+        Check / configure all panotools paths
+        Return True if they are configured correctly
+        """
+        ret = True
+        ret = ret and bool(self.enblend_cli())
+        ret = ret and bool(self.enfuse_cli())
+        ret = ret and bool(self.align_image_stack_cli())
+        return ret
+
+    def enblend_cli(self):
+        if self._enblend_cli:
+            return self._enblend_cli
+        self._enblend_cli = find_panotools_exe(self.j.get("panotools",
+                                                          {}), "enblend_cli",
+                                               "enblend", "enblend")
+        return self._enblend_cli
+
+    def enfuse_cli(self):
+        """
+        flatpak run --command=enfuse net.sourceforge.Hugin --help
+        """
+        if self._enfuse_cli:
+            return self._enfuse_cli
+        self._enfuse_cli = find_panotools_exe(self.j.get("panotools", {}),
+                                              "enfuse_cli", "enfuse", "enfuse")
+        return self._enfuse_cli
+
+    def align_image_stack_cli(self):
+        if self._align_image_stack_cli:
+            return self._align_image_stack_cli
+        self._align_image_stack_cli = find_panotools_exe(
+            self.j.get("panotools", {}), "align_image_stack_cli",
+            "align_image_stack", "align_image_stack")
+        return self._align_image_stack_cli
 
 
 def get_bcj():

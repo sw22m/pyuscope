@@ -1192,6 +1192,24 @@ class GRBL:
     def axes_max_acceleration(self):
         return self.get_dollar_xyz_float("$120", "$121", "$122")
 
+    def axes_set_max_rate(self, axes):
+        axis2reg = {
+            "x": "110",
+            "y": "111",
+            "z": "112",
+        }
+        for axis, value in axes.items():
+            self.gs.txrxs("$%s=%0.3f" % (axis2reg[axis], value))
+
+    def axes_set_max_acceleration(self, axes):
+        axis2reg = {
+            "x": "120",
+            "y": "121",
+            "z": "122",
+        }
+        for axis, value in axes.items():
+            self.gs.txrxs("$%s=%0.3f" % (axis2reg[axis], value))
+
 
 """
 Coordinate system convention
@@ -1260,6 +1278,10 @@ class GrblHal(MotionHAL):
         if rc is not None:
             self.rc_commands(rc)
 
+        damper = get_usc().motion.damper()
+        if damper is not None:
+            self.apply_damper(damper)
+
         # Used to be in ScalarMM but moved here
         # Too much nuance / tied ot GRBL specific things
         self._wcs_offsets_cache = {}
@@ -1320,7 +1342,7 @@ class GrblHal(MotionHAL):
         if "scalar" in self.modifiers:
             scalars = self.modifiers["scalar"].scalars
             for axis in self.axes():
-                steps_per_mm[axis] *= scalars[axis]
+                steps_per_mm[axis] *= abs(scalars[axis])
         return steps_per_mm
 
     def _get_machine_limits(self):
@@ -1478,6 +1500,21 @@ class GrblHal(MotionHAL):
         self.log("  S/N: %s" % (info["sn"], ))
         self.log("  Config: %s" % (info["config"].hex(), ))
 
+    def apply_damper(self, damper):
+        """
+        NOTE: this function is called very early on
+        before configure()
+        We can do it after but would need to maybe call configure again
+        """
+        assert self._hal_max_velocities is None, "must be called before configure()"
+        velocities = self._get_max_velocities()
+        accelerations = self._get_max_accelerations()
+        for axis in self.axes():
+            velocities[axis] = velocities[axis] * damper
+            accelerations[axis] = accelerations[axis] * damper
+        self.grbl.axes_set_max_rate(velocities)
+        self.grbl.axes_set_max_acceleration(accelerations)
+
     def validate_microscope_model(self, name):
         try:
             info = grbl_read_meta(self.grbl.gs)
@@ -1485,6 +1522,7 @@ class GrblHal(MotionHAL):
             # No metadata => skip sanity check
             # Not all microscopes have this set
             return
+        self.microscope.set_serial(info["sn"])
         """
         If the controller supports self-reporting the microscpoe name
         Hack to verify at least until can be auto selected

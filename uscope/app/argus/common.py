@@ -164,6 +164,9 @@ class ArgusCommon(QObject):
         self.usc.app_register("argus", USCArgus)
         self.aconfig = self.usc.app("argus")
         self.bc = get_bc()
+        # force creating directories to make structure more consistent
+        self.bc.batch_data_dir()
+        self.bc.script_data_dir()
 
         # TODO: init things in Microscope and then push references here
         self.microscope = Microscope(bc=self.bc,
@@ -241,11 +244,11 @@ class ArgusCommon(QObject):
         # FIXME: these are not thread safe
         # convert to signals
 
-        # self.microscope.take_snapshot = self.mainTab.snapshot_widget.take_snapshot
+        # self.microscope.take_snapshot = self.mainTab.imaging_widget.take_snapshot
         def take_snapshot_emit():
             self.takeSnapshot.emit()
 
-        self.takeSnapshot.connect(self.mainTab.snapshot_widget.take_snapshot)
+        self.takeSnapshot.connect(self.mainTab.imaging_widget.take_snapshot)
         self.microscope.take_snapshot = take_snapshot_emit
 
         # self.microscope.set_jog_scale = self.mainTab.motion_widget.slider.set_jog_slider
@@ -297,6 +300,13 @@ class ArgusCommon(QObject):
         # emits events + uses queue => already thread safe
         self.microscope.set_imager_ts(self.microscope.imager)
 
+        if not self.bc.check_panotools():
+            self.log("WARNING panotools: incomplete installation")
+            self.log("  enblend: " + str(self.bc.enblend_cli()))
+            self.log("  enfuse: " + str(self.bc.enfuse_cli()))
+            self.log("  align_image_stack: " +
+                     str(self.bc.align_image_stack_cli()))
+
     def shutdown(self):
         if self.motion_thread:
             self.motion_thread.shutdown()
@@ -346,9 +356,12 @@ class ArgusCommon(QObject):
     def get_exposure_disp_property(self):
         return self.control_scroll.get_exposure_disp_property()
 
+    def auto_color_enabled(self):
+        return self.control_scroll.auto_color_enabled()
+
     # FIXME: better abstraction
     def is_idle(self):
-        if not self.mw.mainTab.snapshot_widget.snapshot_pb.isEnabled():
+        if not self.mw.mainTab.imaging_widget.snapshot_pb.isEnabled():
             self.log("Wait for snapshot to complete before CNC'ing")
             return False
         return True
