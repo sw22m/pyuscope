@@ -26,6 +26,7 @@ from io import StringIO
 import math
 from enum import Enum
 import threading
+import uscope.imagej_util as imagej_util
 """
 Argus Widget
 """
@@ -2952,17 +2953,29 @@ class AnnotateImage(QLabel):
     on the base image
     """
 
-    Modes = Enum('Modes', ['SELECT', 'RULER'])
+    Modes = Enum('Modes', ['SELECT', 'RULER', 'RECTANGLE'])
+    areaMeasured = pyqtSignal(list)
+    measureArea = pyqtSignal()
+    setPreview = pyqtSignal(list)
+    measurementSelected = pyqtSignal()
+    updateThreshold = pyqtSignal(dict)
+    thresholdUpdated = pyqtSignal(int, int)  # emits the (lower, upper) values
 
     def __init__(self, filename=None):
         super().__init__()
+        self._ij = None
         self.filename = filename
+        self.image = None
+        self.preview_image = None
         self.mode = self.Modes.SELECT
         self.measurements = []
+        self.current_mouse_position = None
         self.point_a = None
         self.point_b = False
         self.selected_index = -1
         self._pixel_conversion = 1.0
+        self.setMouseTracking(True)
+        self.setPreview.connect(self.set_preview)
 
     @property
     def pixel_conversion(self):
@@ -2974,6 +2987,11 @@ class AnnotateImage(QLabel):
         self.update()  # Repaint when conversion updated
 
     def add_measurement(self, value):
+        # For specific annotations, ensure only one instance can exist
+        if value[0] in ["Rectangle"]:
+            remove_items = [m for m in self.measurements if m[0] == value[0]]
+            for item in remove_items:
+                self.measurements.remove(item)
         self.measurements.append(value)
 
     # Check if the current pos selects a target
@@ -2995,9 +3013,7 @@ class AnnotateImage(QLabel):
                     break
             elif m[0] == "Circle":  # e.g. logic for detecting circle/other shape selection...
                 pass
-            elif m[0] == "Square":
-                pass
-
+        self.measurementSelected.emit()
         self.update()
 
     def delete_selected(self):
@@ -3018,6 +3034,11 @@ class AnnotateImage(QLabel):
         self.point_a = None
         self.point_b = None
 
+        if self.mode in [self.Modes.RECTANGLE, self.Modes.RULER]:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
     def paintEvent(self, e):
         # Make sure to paint the image first
         super().paintEvent(e)
@@ -3026,6 +3047,8 @@ class AnnotateImage(QLabel):
         qp = QPainter()
         qp.begin(self)
         pen = QPen(Qt.blue)
+
+        # qp.fillRect(QRect(QPoint(0,0), QPoint(500,500)))
 
         def draw_point(point):
             circ_radius = 4
@@ -3063,19 +3086,40 @@ class AnnotateImage(QLabel):
                         (start.y() + end.y()) // 2 + dy,
                         "%0.2f µm" % (self.pixel_conversion * distance, ))
 
+        def draw_rectangle(start, end):
+            pen.setWidth(3)
+            qp.setPen(pen)
+            qp.drawRect(QRect(start, end))
+
         selected_color = QColor(43, 250, 43, 200)
-        default_color = QColor(43, 43, 43, 200)
+        default_color = QColor(80, 80, 130, 200)
         for n, m in enumerate(self.measurements):
-            pen.setColor(default_color)
             if n == self.selected_index:
                 pen.setColor(selected_color)
+            else:
+                pen.setColor(default_color)
             if m[0] == "Line":
                 draw_labelled_line(m[1], m[2])
+            elif m[0] == "Rectangle":
+                draw_rectangle(m[1], m[2])
 
-        if self.point_a:
+        if self.point_a and not self.point_b:
+            if self.mode == self.Modes.RULER:
+                point_color = QColor(43, 43, 250, 200)
+                pen.setColor(point_color)
+                draw_point(self.point_a)
+
+        # Dynamic draw to provide live preview
+        dynamic_draw = None
+        if self.point_a and not self.point_b and self.current_mouse_position:
+            if self.mode == self.Modes.RULER:
+                draw_labelled_line(self.point_a, self.current_mouse_position)
+            elif self.mode == self.Modes.RECTANGLE:
+                draw_rectangle(self.point_a, self.current_mouse_position)
+
+        if self.point_b:
             point_color = QColor(43, 43, 250, 200)
             pen.setColor(point_color)
-            draw_point(self.point_a)
 
         qp.end()
 
@@ -3085,17 +3129,28 @@ class AnnotateImage(QLabel):
             self.select(event.pos())
             return
 
-        if self.mode == self.Modes.RULER:
-            if not self.point_a:
-                self.point_a = event.pos()
-                self.update()
-                return
-            if self.point_a:
+        if not self.point_a:
+            self.point_a = event.pos()
+            self.update()
+            return
+
+        if self.point_a:
+            if self.mode == self.Modes.RULER:
                 self.add_measurement(["Line", self.point_a, event.pos()])
-                self.point_a = None
-                self.point_b = None
+            elif self.mode == self.Modes.RECTANGLE:
+                self.add_measurement(["Rectangle", self.point_a, event.pos()])
+            self.point_a = None
+            self.point_b = None
 
         self.update()
+
+    def mouseMoveEvent(self, event):
+        """
+        Tracks the current mouse position on the image
+        """
+        self.current_mouse_position = event.pos()
+        if self.point_a:  # Refresh for live update
+            self.update()
 
     def undo(self):
         try:
@@ -3109,17 +3164,69 @@ class AnnotateImage(QLabel):
         self.measurements = []
         self.update()
 
+    def set_image(self, pil_image):
+        self.image = pil_image
+        image = pil_image.convert("RGBA")
+        data = image.tobytes("raw", "RGBA")
+        qim = QImage(data, image.size[0], image.size[1], QImage.Format_RGBA8888)
+        self.clear_all()
+        self.setPixmap(QPixmap.fromImage(qim))
+        self.adjustSize()
+        self.update()
+
+    def set_preview(self, pil_image):
+        self.preview_image = pil_image[0]
+        image = self.preview_image.convert("RGBA")
+        data = image.tobytes("raw", "RGBA")
+        qim = QImage(data, image.size[0], image.size[1], QImage.Format_RGBA8888)
+        self.setPixmap(QPixmap.fromImage(qim))
+        self.adjustSize()
+        self.update()
+
+    def get_pil_image(self):
+        from io import BytesIO
+        # Get the image buffer and return as PIL image
+        if not self.pixmap():
+            return None
+        img = self.pixmap().toImage()
+        buffer = QBuffer()
+        buffer.open(QBuffer.ReadWrite)
+        img.save(buffer, "PNG")
+        pil_im = Image.open(BytesIO(buffer.data()))
+        buffer.close()
+        return pil_im
+
+    def get_roi(self):
+        for m in self.measurements:
+            if m[0] == "Rectangle":
+                x1, y1 = m[1].x(), m[1].y()
+                x2, y2 = m[2].x(), m[2].y()
+                w, h = abs(x2 - x1), abs(y2 - y1)
+                x, y = min(x1, x2), min(y1, y2)
+                rect = [x, y, w, h]
+                return rect
+
+        return None
+
 
 class MeasureTab(ArgusTab):
+
+    pluginExecuted = pyqtSignal(dict)
     def __init__(self, ac, parent=None):
         super().__init__(ac=ac, parent=parent)
-
         layout = QGridLayout()
         row = 0
 
         def stack_gb():
             layout = QGridLayout()
             row = 0
+
+            # Define first as some callbacks need reference
+            self.annotate_image = AnnotateImage()
+            self.annotate_image.setBackgroundRole(QPalette.Base)
+            self.annotate_image.setSizePolicy(QSizePolicy.Ignored,
+                                              QSizePolicy.Ignored)
+            self.annotate_image.setScaledContents(True)
 
             # Opening images is not supported at this time
             # Need metadata (EXIF, etc) support
@@ -3130,27 +3237,43 @@ class MeasureTab(ArgusTab):
                 hbox.addWidget(self.open_image_pb)
                 hbox.addStretch()
                 layout.addLayout(hbox, row, 0)
+
             row += 1
-            self.annotate_image = AnnotateImage()
-            self.annotate_image.setBackgroundRole(QPalette.Base)
-            self.annotate_image.setSizePolicy(QSizePolicy.Ignored,
-                                              QSizePolicy.Ignored)
-            self.annotate_image.setScaledContents(True)
+            self.pb_grid = QHBoxLayout()
+            layout.addLayout(self.pb_grid, row, 1)
+            def add_to_pb_grid(label, callback):
+                pb = QPushButton(label)
+                pb.clicked.connect(callback)
+                self.pb_grid.addWidget(pb)
+
+            add_to_pb_grid("Measure Area", self.on_measure_area)
+            self.pb_grid.addStretch()
+
+            row += 1
+            tools_widget = QWidget()
+            tools_bar = QVBoxLayout()
+            tools_widget.setLayout(tools_bar)
+            self.tools_group = QButtonGroup(tools_widget)
+            self.tools_group.buttonClicked.connect(self.on_tool_clicked)
+            self.tools_group.setExclusive(False)
+            for label in ["Ruler", "Rectangle"]:
+                pb = QPushButton(label)
+                pb.setCheckable(True)
+                pb.setStyleSheet("QPushButton:checked { background-color: lightblue; border: 1px solid black;}")
+                self.tools_group.addButton(pb)
+                tools_bar.addWidget(pb)
+            tools_bar.addStretch()
+            layout.addWidget(tools_widget, row, 0)
+
             self.sa_image = QScrollArea()
             self.sa_image.setBackgroundRole(QPalette.Dark)
             self.sa_image.setWidget(self.annotate_image)
             self.sa_image.setVisible(False)
-            layout.addWidget(self.sa_image, row, 0)
-            self.pb_grid = QVBoxLayout()
-            self.ruler_pb = QPushButton("Ruler")
-            self.ruler_pb.setCheckable(True)
-            self.ruler_pb.clicked.connect(self.on_ruler)
-            self.pb_grid.addWidget(self.ruler_pb)
-            self.pb_grid.addStretch()
-            self.clear_all_pb = QPushButton("Clear All")
-            self.clear_all_pb.clicked.connect(self.annotate_image.clear_all)
-            self.pb_grid.addWidget(self.clear_all_pb)
-            layout.addLayout(self.pb_grid, row, 1)
+            layout.addWidget(self.sa_image, row, 1)
+
+            clear_all_pb = QPushButton("Clear All")
+            clear_all_pb.clicked.connect(self.annotate_image.clear_all)
+            tools_bar.addWidget(clear_all_pb)
 
             gb = QGroupBox("")
             gb.setLayout(layout)
@@ -3167,22 +3290,12 @@ class MeasureTab(ArgusTab):
 
         self.ac.snapshotCaptured.connect(self.snapshot_processed)
 
+        # Dialogs - to keep single dialog instance mode
+        self.measure_dlg = None
+
     @pyqtSlot()
     def on_undo(self):
         self.annotate_image.undo()
-
-    def on_ruler(self, event):
-        """
-        Toggle ruler mode
-        """
-        if self.ruler_pb.isChecked():
-            self.annotate_image.set_mode(self.annotate_image.Modes.RULER)
-            self.ruler_pb.setStyleSheet(
-                f"color: white; background-color: green;")
-        else:
-            self.annotate_image.set_mode(self.annotate_image.Modes.SELECT)
-            self.ruler_pb.setStyleSheet(
-                f"color: black; background-color: lightgrey;")
 
     def fitToWindow(self):
         self.scrollArea.setWidgetResizable(True)
@@ -3230,15 +3343,246 @@ class MeasureTab(ArgusTab):
             return
         self.annotate_image.pixel_conversion = data["objective_config"][
             "um_per_pixel"]
-        # Convert PIL image to QT image
-        image = image.convert("RGBA")
-        data = image.tobytes("raw", "RGBA")
-        qim = QImage(data, image.size[0], image.size[1],
-                     QImage.Format_RGBA8888)
-        self.annotate_image.clear_all()
-        self.annotate_image.setPixmap(QPixmap.fromImage(qim))
+        self.annotate_image.set_image(image)
         self.sa_image.setVisible(True)
-        self.annotate_image.adjustSize()
         # Need ruler before select mode is useful
-        self.ruler_pb.setChecked(True)
-        self.on_ruler(None)
+        self.select_tool_button("Ruler")
+
+    def select_tool_button(self, tool_name=None):
+        """
+        Select the tool given its name
+        """
+        for pb in self.tools_group.buttons():
+            if tool_name == pb.text():
+                pb.setChecked(True)
+            else:
+                pb.setChecked(False)
+
+        if not tool_name:
+            self.annotate_image.set_mode(self.annotate_image.Modes.SELECT)
+        elif tool_name == "Ruler":
+            self.annotate_image.set_mode(self.annotate_image.Modes.RULER)
+        elif tool_name == "Rectangle":
+            self.annotate_image.set_mode(self.annotate_image.Modes.RECTANGLE)
+
+    def on_tool_clicked(self, button):
+        if button.isChecked():
+            button.setChecked(False)
+            self.select_tool_button(button.text())
+        else:
+            self.select_tool_button(None)
+
+    def on_measure_area(self):
+        if self.measure_dlg:
+            self.measure_dlg.show()
+            self.measure_dlg.activateWindow()
+            return
+        self.measure_dlg = MeasureAreaDialog(self, self.annotate_image)
+
+class ThresholdControls(QWidget):
+    """
+    Configure and apply thresholds to create an image mask
+    """
+    autoThresholdUpdated = pyqtSignal()
+    manualThresholdUpdated = pyqtSignal()
+    def __init__(self, parent):
+        super().__init__(parent=parent)
+        vbox = QVBoxLayout()
+        self.setLayout(vbox)
+
+        # Threshold controls
+        gb = QGroupBox("Threshold")
+        vbox.addWidget(gb)
+        vbox_threshold = QVBoxLayout(gb)
+
+        # Auto threshold controls
+        hbox_modes = QHBoxLayout()
+        vbox_threshold.addLayout(hbox_modes)
+        hbox_modes.addWidget(QLabel("Method"))
+        threshold_modes = ["Manual", "Default", "Huang", "Intermodes", "IsoData", "IJ_IsoData",
+                           "Li", "MaxEntropy", "Mean", "MinError", "Minimum", "Moments",
+                           "Otsu", "Percentile", "RenyiEntropy", "Shanbhag", "Triangle", "Yen"]
+        self.modes_cb = QComboBox()
+        for threshold in threshold_modes:
+            self.modes_cb.addItem(threshold)
+        self.modes_cb.currentIndexChanged.connect(self.on_threshold_mode)
+        hbox_modes.addWidget(self.modes_cb)
+
+        grid_sliders = QGridLayout()
+        vbox_threshold.addLayout(grid_sliders)
+        self.lower_label = QLabel("Lower:")
+        grid_sliders.addWidget(self.lower_label, 0, 0)
+        self.lower_slider = QSlider()
+        self.lower_slider.setMaximum(255)
+        self.lower_slider.setOrientation(Qt.Horizontal)
+        self.lower_slider.valueChanged.connect(self.on_lower_slider_changed)
+        grid_sliders.addWidget(self.lower_slider, 0, 1)
+        self.lower_input = QLineEdit()
+        self.lower_input.returnPressed.connect(self.on_lower_input_changed)
+        t_validator = QIntValidator()
+        t_validator.setTop(255)
+        t_validator.setBottom(0)
+        self.lower_input.setValidator(t_validator)
+        grid_sliders.addWidget(self.lower_input, 0, 2)
+
+        self.upper_label = QLabel("Upper:")
+        grid_sliders.addWidget(self.upper_label, 1, 0)
+        self.upper_slider = QSlider()
+        self.upper_slider.setMaximum(255)
+        self.upper_slider.setOrientation(Qt.Horizontal)
+        self.upper_slider.valueChanged.connect(self.on_upper_slider_changed)
+        grid_sliders.addWidget(self.upper_slider, 1, 1)
+        self.upper_input = QLineEdit()
+        self.upper_input.returnPressed.connect(self.on_upper_input_changed)
+        self.upper_input.setValidator(t_validator)
+        grid_sliders.addWidget(self.upper_input, 1, 2)
+
+        self.lower_slider.setValue(170)
+        self.upper_slider.setValue(255)
+
+    def get_mode(self):
+        """
+        Get the selected threshold mode
+        """
+        return self.modes_cb.currentText()
+
+    def on_lower_input_changed(self):
+        self.lower_slider.setValue(int(self.lower_input.text()))
+
+    def on_upper_input_changed(self):
+        self.upper_slider.setValue(int(self.upper_input.text()))
+
+    def on_lower_slider_changed(self):
+        """
+        Lower threshold can not be greater than the upper threshold
+        """
+        if self.lower_slider.value() > self.upper_slider.value():
+            self.upper_slider.setValue(self.lower_slider.value())
+        lower = self.lower_slider.value()
+        upper = self.upper_slider.value()
+        self.lower_input.setText(f"{self.lower_slider.value()}")
+        self.upper_input.setText(f"{self.upper_slider.value()}")
+        self.manual_threshold_changed()
+
+    def on_upper_slider_changed(self):
+        """
+        Upper threshold can not be less than the lower threshold
+        """
+        if self.upper_slider.value() < self.lower_slider.value():
+            self.lower_slider.setValue(self.upper_slider.value())
+        self.lower_input.setText(f"{self.lower_slider.value()}")
+        self.upper_input.setText(f"{self.upper_slider.value()}")
+        self.manual_threshold_changed()
+
+    def threshold_updated(self, lower, upper):
+        self.lower_slider.setValue(lower)
+        self.upper_slider.setValue(upper)
+
+    def manual_threshold_changed(self, apply=False):
+        """
+        Request a new mask based on user defined threshold
+        """
+        if self.isEnabled():
+            # Can be improved better but this allows switching to Manual
+            # selection when user changes combobox option
+            self.modes_cb.currentIndexChanged.disconnect(self.on_threshold_mode)
+            self.modes_cb.setCurrentIndex(0)
+            self.modes_cb.currentIndexChanged.connect(self.on_threshold_mode)
+
+        self.manualThresholdUpdated.emit()
+
+    def on_threshold_mode(self):
+        """
+        Handler for any auto threshold controls changed
+        """
+        mode = self.modes_cb.currentText()
+        if mode == "Manual":
+            return
+        self.autoThresholdUpdated.emit()
+
+
+class MeasureAreaDialog(QWidget):
+
+    measureArea = pyqtSignal()
+    def __init__(self, parent, annotate_image):
+        super().__init__(parent=parent)
+        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        self.setWindowTitle("Measure Area")
+        self.annotate_image = annotate_image
+        self.mask = None
+        self.result_mask = None
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        self.table = QTableWidget(self)
+
+        self.threshold_controls = ThresholdControls(self)
+        self.threshold_controls.autoThresholdUpdated.connect(self.threshold_changed_auto)
+        self.threshold_controls.manualThresholdUpdated.connect(self.threshold_changed_manual)
+        layout.addWidget(self.threshold_controls)
+
+        layout.addWidget(self.table)
+        self.measure_pb = QPushButton("Measure", self)
+        self.measure_pb.clicked.connect(self.on_measure_pb)
+        layout.addWidget(self.measure_pb)
+
+        self.show()
+        self.measureArea.connect(self.measure_area)
+
+    def on_result_opacity_changed(self):
+        if not self.result_mask:
+            return
+
+    def on_measure_pb(self):
+        if not self.mask:
+            return
+        self.measure_pb.setEnabled(False)
+        self.measureArea.emit()
+
+    def measure_area(self):
+        # TODO: specify particle size
+        min_particle = 10
+        max_particle = 30
+        roi = self.annotate_image.get_roi()
+        results = imagej_util.measure_areas(self.mask, roi=roi)
+        preview = self.mask
+        preview = preview.convert('RGBA')
+        preview.paste(results["image_result"], mask=results["image_result"])
+        pixel_conversion = self.annotate_image.pixel_conversion
+        print(pixel_conversion)
+        self.annotate_image.setPreview.emit([preview])
+        self.update_area_results(results["csv"])
+        self.measure_pb.setEnabled(True)
+
+    def update_area_results(self, data):
+        self.table.setRowCount(0)  # Clear previous results
+        if len(data) == 0:
+            return
+        headers = data[0]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        for row, row_data in enumerate(data[1:]):
+            self.table.insertRow(row)
+            for column, value in enumerate(row_data):
+                self.table.setItem(row, column, QTableWidgetItem(f"{value}"))
+
+    def threshold_changed_auto(self):
+        image = self.annotate_image.image
+        result = imagej_util.threshold_image_auto(image, self.threshold_controls.get_mode())
+        # Update the controls based on the results of the auto threshold
+        try:
+            self.mask = result.get("image_mask")
+            self.threshold_controls.setEnabled(False)
+            self.threshold_controls.lower_slider.setValue(result["lower_threshold"])
+            self.threshold_controls.upper_slider.setValue(result["upper_threshold"])
+            self.threshold_controls.setEnabled(True)
+        except KeyError:
+            pass  # TODO: handle invalid result
+        self.annotate_image.setPreview.emit([self.mask])
+
+    def threshold_changed_manual(self):
+        image = self.annotate_image.image
+        lower_threshold = self.threshold_controls.lower_slider.value()
+        upper_threshold = self.threshold_controls.upper_slider.value()
+        result = imagej_util.threshold_image_manual(image, lower_threshold, upper_threshold)
+        self.mask = result["image_mask"]
+        self.annotate_image.setPreview.emit([self.mask])
