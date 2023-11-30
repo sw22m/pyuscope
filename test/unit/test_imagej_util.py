@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Running the full suite:
--GRBL controller attached (no microscope)
--E3ISPM20000KPA camera attached
--v4levice as /dev/video0 that supports 640x480 video
-    Ex: my X1 carbon has this as built in web camera
+
 """
 
 import unittest
