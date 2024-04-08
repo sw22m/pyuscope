@@ -13,6 +13,7 @@ import signal
 from collections import OrderedDict
 import math
 from uscope.imager.plugins.aplugins import get_imager_aplugin
+from uscope.script.webrtc_client import WebRTCClient
 
 import gi
 
@@ -429,6 +430,10 @@ class GstVideoPipeline:
         self.rtsp_bin = None
         self.rtsp_server = None
         self.rtsp_media_factory = None
+        # WebRTC
+        self.webrtc_client = None
+        self.webrtc_bin = None
+
 
     def create_widget(self, widget_name):
         t = self.imager_aplugin.get_widget()
@@ -843,6 +848,32 @@ class GstVideoPipeline:
         self.player.set_state(Gst.State.PLAYING)
         self.ac.imager.device_restarted()
         self.ok = True
+
+    def start_webrtc_session(self, peer_id):
+        if self.webrtc_client:
+            self.webrtc_client.connect_to_peer(peer_id)
+            return
+
+        def onWebRtcBinReady(webrtc_bin):
+            if self.webrtc_bin:
+                self.player.set_state(Gst.State.PAUSED)
+                self.player.remove(self.webrtc_client.webrtc)
+                self.player.set_state(Gst.State.PLAYING)
+            self.webrtc_bin = webrtc_bin
+            self.player.set_state(Gst.State.PAUSED)
+            self.link_tee_dsts(self.tee_vc, [webrtc_bin], add=True)
+            self.player.set_state(Gst.State.PLAYING)
+
+        self.webrtc_client = WebRTCClient(peer_id, onWebRtcBinReady)
+        self.webrtc_client.start()
+
+    def stop_webrtc_session(self):
+        if self.webrtc_client:
+            self.webrtc_client.stop()
+            self.player.set_state(Gst.State.PAUSED)
+            self.player.remove(self.webrtc_client.webrtc)
+            self.player.set_state(Gst.State.PLAYING)
+        self.webrtc_client = None
 
 
 class RtspBin(Gst.Bin):

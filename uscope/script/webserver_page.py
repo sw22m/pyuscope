@@ -42,19 +42,21 @@ $ curl -X POST 'http://localhost:8080/set/pos/?y=1&x=-1&relative=1'; echo
 from uscope.gui.scripting import ArgusScriptingPlugin
 from uscope.script import webserver_common
 
-from flask import Flask, current_app, request, render_template, send_from_directory
-import json
+from flask import Flask, request, current_app, render_template, send_from_directory
 from werkzeug.serving import make_server
 from flask_cors import CORS
 import cv2
-from flask_socketio import SocketIO
 import base64
 import numpy as np
+import websockets
+from flask_sock import Sock
 
 FLUTTER_WEB_DIR = "web"
 app = Flask(__name__, template_folder=FLUTTER_WEB_DIR)
+# Keep alive and for detecting unresponsive clients
+app.config['SOCK_SERVER_OPTIONS'] = {'ping_interval': 25}
 CORS(app)
-SERVER_PORT = 8080
+SERVER_PORT = 8443
 HOST = '127.0.0.1'
 
 
@@ -67,37 +69,195 @@ def image_to_base64(p_img):
     return b64_src + string_data
 
 
-class MySocket(SocketIO):
-    def __init__(self, *args, **kwargs):
-        webserver_common.plugin = self
-        super().__init__(*args, **kwargs)
-        self.clients = set()
-        self.on_event('connect', self.on_connection)
-        self.on_event('disconnect', self.on_disconnection)
+class SignallingServer(Sock):
 
-    def on_connection(self):
-        if not self.clients:
-            self.start_background_task(self.video_feed, current_app.plugin)
-        self.clients.add(request.sid)
-        plugin = current_app.plugin
-        plugin.log_verbose(
-            f"Client connected: connections = {len(self.clients)}")
-        self.emit('client_connected')
+    KEEPALIVE_TIMEOUT = 30
 
-    def on_disconnection(self):
-        self.clients.remove(request.sid)
-        plugin = current_app.plugin
-        plugin.log_verbose(
-            f"Client disconnected: connections = {len(self.clients)}")
+    def __init__(self, app = None):
+        super().__init__(app=app)
+        self.peers: dict = {}
+        self.sessions: dict = {}
+        self.rooms: dict = {}
+        make_socket(self)
 
-    def video_feed(self, plugin):
-        while plugin.server:
-            image = plugin.image()
-            string_data = image_to_base64(image)
-            self.emit('video_feed_back', string_data)
+    def cleanup_session(self, uid):
+        if uid in self.sessions:
+            other_id = self.sessions[uid]
+            del self.sessions[uid]
+            current_app.plugin.log("Cleaned up session: {uid}")
+            if other_id in self.sessions:
+                del self.sessions[other_id]
+                current_app.plugin.log(f"Also cleaned up session: {other_id}")
+                # If there was a session with this peer, also
+                # close the connection to reset its state.
+                if other_id in self.peers:
+                    current_app.plugin.log(f"Closing connection to {other_id}")
+                    wso, oaddr, _ = self.peers[other_id]
+                    del self.peers[other_id]
+                    wso.close()
 
-    def disconnect_clients(self):
-        self.emit("disconnect")
+    def cleanup_room(self, uid, room_id):
+        room_peers = self.rooms[room_id]
+        if uid not in room_peers:
+            return
+        room_peers.remove(uid)
+        for pid in room_peers:
+            wsp, paddr, _ = self.peers[pid]
+            msg = f"ROOM_PEER_LEFT {uid}"
+            wsp.send(msg)
+
+    def remove_peer(self, uid):
+        self.cleanup_session(uid)
+        if uid in self.peers:
+            ws, raddr, status = self.peers[uid]
+            if status and status != "session":
+                self.cleanup_room(uid, status)
+            del self.peers[uid]
+            ws.close()
+            current_app.plugin.log(f"Disconnected from peer {uid} at {raddr}")
+
+def make_socket(sock):
+
+    def get_remote_addr(ws):
+        return ws.sock.getpeername()
+
+    @sock.route("/webrtc")
+    def webrtc(ws):
+        peer_id = ws.receive()
+        current_app.plugin.start_webrtc_session(int(peer_id))
+
+    @sock.route("/")
+    def handler(ws):
+        """All connections start from here"""
+        peer_id = hello_peer(ws) # Wait for connected client to register
+        if peer_id is None:
+            return
+        # if request.environ.get("HTTP_X_FORWARDED_FOR") is None:
+        #     print(request.environ["REMOTE_ADDR"])
+        # else:
+        #     print(request.environ["HTTP_X_FORWARDED_FOR"]) # if behind a proxy
+        raddr = get_remote_addr(ws)
+        # print(f"Connected to {raddr}")
+        try:
+            # Registered peer, now continue to listen
+            connection_handler(ws, peer_id)
+        except websockets.ConnectionClosed:
+            current_app.plugin.log("Connection to peer {raddr} closed, exiting handler")
+        except Exception as e:
+            pass
+            # print(e)
+        finally:
+            sock.remove_peer(peer_id)
+
+    def hello_peer(ws):
+        """Client registers as a peer by sending `HELLO <uid>`"""
+        try:
+            # print('Websocket connected', ws, ' - ')
+            message = ws.receive()
+            hello, uid = message.split(maxsplit=1)
+            # print('message received', hello, uid)
+            if hello != "HELLO":
+                ws.close(reason="invalid protocol")
+                return None
+            if not uid or uid in sock.peers or uid.split() != [uid]: # no whitespace
+                ws.close(reason="invalid peer uid")
+            ws.send("HELLO")  # Acknowledge the peer
+            return uid
+        except websockets.ConnectionClosed as e:
+            # print("A client just disconnected")
+            ws.close()
+        return None
+
+    def connection_handler(ws, uid):
+        raddr = get_remote_addr(ws)
+        peer_status = None
+        sock.peers[uid] = [ws, raddr, peer_status]
+        current_app.plugin.log(f"Registered peer {uid} at {raddr}")
+        while True:
+            # Receive command, wait forever if necessary
+            msg = ws.receive(timeout=SignallingServer.KEEPALIVE_TIMEOUT)
+            # Update current status
+            peer_status = sock.peers[uid][2]
+            # We are in a session or a room, messages must be relayed
+            if peer_status is not None:
+                # We"re in a session, route message to connected peer
+                if peer_status == "session":
+                    other_id = sock.sessions[uid]
+                    wso, oaddr, status = sock.peers[other_id]
+                    assert(status == "session")
+                    wso.send(msg)
+                # We"re in a room, accept room-specific commands
+                elif peer_status:
+                    # ROOM_PEER_MSG peer_id MSG
+                    if msg.startswith("ROOM_PEER_MSG"):
+                        _, other_id, msg = msg.split(maxsplit=2)
+                        if other_id not in sock.peers:
+                            ws.send(f"ERROR peer {other_id} not found")
+                            continue
+                        wso, oaddr, status = sock.peers[other_id]
+                        if status != room_id:
+                            ws.send(f"ERROR peer {other_id} is not in the room")
+                            continue
+                        msg = f"ROOM_PEER_MSG {uid} {msg}"
+                        current_app.plugin.log(f"room {room_id}: {uid} -> {other_id}: {msg}")
+                        wso.send(msg)
+                    elif msg == "ROOM_PEER_LIST":
+                        room_id = sock.peers[peer_id][2]
+                        room_peers = " ".join([pid for pid in sock.rooms[room_id] if pid != sock.peer_id])
+                        msg = f"ROOM_PEER_LIST {room_peers}"
+                        current_app.plugin.log(f"room {room_id}: -> {uid}: {msg}")
+                        ws.send(msg)
+                    else:
+                        ws.send("ERROR invalid msg, already in room")
+                        continue
+                else:
+                    raise AssertionError(f"Unknown peer status {peer_status}")
+            # Requested a session with a specific peer
+            elif msg.startswith("SESSION"):
+                current_app.plugin.log(f"Command from {uid}: {msg}")
+                _, callee_id = msg.split(maxsplit=1)
+                if callee_id not in sock.peers:
+                    ws.send(f"ERROR peer {callee_id} not found")
+                    continue
+                if peer_status is not None:
+                    ws.send(f"ERROR peer {callee_id} busy")
+                    continue
+                ws.send("SESSION_OK")
+                wsc = sock.peers[callee_id][0]
+                current_app.plugin.log(f"Session from peer {uid} ({raddr}) to peer {callee_id} ({get_remote_addr(wsc)})")
+                # Register session
+                sock.peers[uid][2] = peer_status = "session"
+                sock.sessions[uid] = callee_id
+                sock.peers[callee_id][2] = "session"
+                sock.sessions[callee_id] = uid
+            # Requested joining or creation of a room
+            elif msg.startswith("ROOM"):
+                current_app.plugin.log(f"{uid} command {msg}")
+                _, room_id = msg.split(maxsplit=1)
+                # Room name cannot be "session", empty, or contain whitespace
+                if room_id == "session" or room_id.split() != [room_id]:
+                    ws.send(f"ERROR invalid room id {room_id}")
+                    continue
+                if room_id in sock.rooms:
+                    if uid in sock.rooms[room_id]:
+                        raise AssertionError("Should not receive ROOM command from member client")
+                else:
+                    # Create room if required
+                    sock.rooms[room_id] = set()
+                room_peers = " ".join([pid for pid in sock.rooms[room_id]])
+                ws.send(f"ROOM_OK {room_peers}")
+                # Enter room
+                sock.peers[uid][2] = peer_status = room_id
+                sock.rooms[room_id].add(uid)
+                for pid in sock.rooms[room_id]:
+                    if pid == uid:
+                        continue
+                    wsp, paddr, _ = sock.peers[pid]
+                    msg = f"ROOM_PEER_JOINED {uid}"
+                    current_app.plugin.log(f"room {room_id}: {uid} -> {pid}: {msg}")
+                    wsp.send(msg)
+            else:
+                current_app.plugin.log(f"Ignoring unknown message {msg} from {uid}")
 
 
 class Plugin(ArgusScriptingPlugin):
@@ -115,20 +275,23 @@ class Plugin(ArgusScriptingPlugin):
         self.log(f"Running Pyuscope Webserver Plugin on port: {SERVER_PORT}")
         self.objectives = self._ac.microscope.get_objectives()
         if not self.socket:
-            self.socket = MySocket(app, cors_allowed_origins="*")
+            self.socket = SignallingServer(app)
 
         # Keep a reference to this plugin
         app.plugin = self
+        ssl_context = "adhoc"
+        ssl_context=("cert.pem", "key.pem")
         self.server = make_server(host=HOST,
                                   port=SERVER_PORT,
                                   app=app,
-                                  threaded=True)
+                                  threaded=True,
+                                  ssl_context=ssl_context)
         self.ctx = app.app_context()
         self.ctx.push()
         self.server.serve_forever(0.1)
 
     def shutdown(self):
-        self.socket.disconnect_clients()
+        app.plugin.stop_webrtc_session()
         self.server.shutdown()
         self.server.server_close()
         super().shutdown()
