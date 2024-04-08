@@ -278,7 +278,6 @@ class WebRTCClient(Thread):
                 elif message == 'SESSION_OK':
                     self.init_webrtc_bin()
                 elif message.startswith('ERROR'):
-                    print("msg-received", message)
                     raise Exception(message)
                 else:
                     await self.handle_sdp(message)
