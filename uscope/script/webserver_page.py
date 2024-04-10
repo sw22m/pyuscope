@@ -50,6 +50,7 @@ import base64
 import numpy as np
 import websockets
 from flask_sock import Sock
+import os
 
 FLUTTER_WEB_DIR = "web"
 app = Flask(__name__, template_folder=FLUTTER_WEB_DIR)
@@ -280,6 +281,10 @@ class Plugin(ArgusScriptingPlugin):
         # Keep a reference to this plugin
         app.plugin = self
         ssl_context = "adhoc"
+        if not os.path.exists("cert.pem") or not os.path.exists("key.pem"):
+            print("Temporary message: example command to generate self signed certs. Place in script folder")
+            print("ex. openssl req -x509 -newkey rsa:4096 -nodes -out cert.pem -keyout key.pem -days 365")
+            raise FileNotFoundError("SSL Certificates not found required for WebRTC communication")
         ssl_context=("cert.pem", "key.pem")
         self.server = make_server(host=HOST,
                                   port=SERVER_PORT,
