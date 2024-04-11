@@ -115,12 +115,11 @@ class MyWebRtcBin(Gst.Bin):
 
 class WebRTCClient(Thread):
 
-    webRtcBinReady = pyqtSignal(object)
-
     def __init__(self, peer_id, binReadycb):
         super().__init__()
         self._id = random.randrange(10, 10000)
         self.binReadycb = binReadycb
+        self.loop = asyncio.new_event_loop()
         self.ws = None
         self.pipe = None
         self.webrtc = None
@@ -135,26 +134,27 @@ class WebRTCClient(Thread):
 
     def connect_to_peer(self, peer_id):
         """Establish new connection with peer"""
-        self.peer_id = None
-        self.stop()
         self.peer_id = peer_id
 
     def run(self) -> None:
         while True:
             if self.peer_id is not None:
                 try:
-                    self.loop = asyncio.new_event_loop()
+                    print(f"WebRTC connecting to {self.peer_id}")
+                    self._id = random.randrange(10, 10000)
                     self.loop.run_until_complete(self.init_connection())
                     self.loop.run_until_complete(self.message_handler())
                 except websockets.ConnectionClosed as e:
                     self.peer_id = None
                 except Exception as e:
                     self.peer_id = None
+                if not self.loop:
+                    break
             time.sleep(1)
 
     async def init_connection(self):
         self.ws = await websockets.connect(self.server, ssl=self.sslctx)
-        print("Webrtc client init myid:", self._id)
+        print("Webrtc Client Init myId:", self._id)
         await self.ws.send(f'HELLO {self._id}')
 
     async def setup_call(self):
@@ -278,20 +278,24 @@ class WebRTCClient(Thread):
                 elif message == 'SESSION_OK':
                     self.init_webrtc_bin()
                 elif message.startswith('ERROR'):
-                    raise Exception(message)
+                    # raise Exception(message)
+                    break # TODO = keep alive or continue
                 else:
                     await self.handle_sdp(message)
         except Exception as e:
-            await self.stop()
+            self.shutdown()
             raise Exception(e)
-        
 
-    async def stop(self):
-        await self.ws.close()
-        await self.loop.stop()
-        self.ws = None
+    # async def stop(self):
+    #     try:
+    #         await self.ws.close(1000)
+    #     except Exception as e:
+    #         self.ws = None
+    #     self.peer_id = None
+
+    def shutdown(self):
+        self.loop.stop()
         self.loop = None
-        self.peer_id = None
 
 def check_plugins():
     needed = ["opus", "vpx", "webrtc", "dtls", "srtp", "rtp",

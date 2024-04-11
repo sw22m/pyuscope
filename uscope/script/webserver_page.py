@@ -85,7 +85,7 @@ class SignallingServer(Sock):
         if uid in self.sessions:
             other_id = self.sessions[uid]
             del self.sessions[uid]
-            current_app.plugin.log("Cleaned up session: {uid}")
+            current_app.plugin.log(f"Cleaned up session: {uid}")
             if other_id in self.sessions:
                 del self.sessions[other_id]
                 current_app.plugin.log(f"Also cleaned up session: {other_id}")
@@ -160,8 +160,10 @@ def make_socket(sock):
             if hello != "HELLO":
                 ws.close(reason="invalid protocol")
                 return None
-            if not uid or uid in sock.peers or uid.split() != [uid]: # no whitespace
-                ws.close(reason="invalid peer uid")
+            if not uid or uid.split() != [uid]: # no whitespace
+                ws.close(reason=f"invalid peer: `{uid}`")
+            if uid in sock.peers:
+                ws.close(reason=f"Peer already exists: {uid}")
             ws.send("HELLO")  # Acknowledge the peer
             return uid
         except websockets.ConnectionClosed as e:
@@ -280,12 +282,13 @@ class Plugin(ArgusScriptingPlugin):
 
         # Keep a reference to this plugin
         app.plugin = self
-        ssl_context = "adhoc"
-        if not os.path.exists("cert.pem") or not os.path.exists("key.pem"):
-            print("Temporary message: example command to generate self signed certs. Place in script folder")
-            print("ex. openssl req -x509 -newkey rsa:4096 -nodes -out cert.pem -keyout key.pem -days 365")
-            raise FileNotFoundError("SSL Certificates not found required for WebRTC communication")
-        ssl_context=("cert.pem", "key.pem")
+
+        # Cert chain
+        cert_path = "uscope/script/assets/cert.pem"
+        cert_key_path = "uscope/script/assets/cert-key.pem"
+        if not os.path.exists(cert_path) or not os.path.exists(cert_key_path):
+            raise Warning("SSL Certificate not found required for WebRTC communication")
+        ssl_context=(cert_path, cert_key_path)
         self.server = make_server(host=HOST,
                                   port=SERVER_PORT,
                                   app=app,

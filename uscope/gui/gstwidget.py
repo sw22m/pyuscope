@@ -868,11 +868,16 @@ class GstVideoPipeline:
         self.webrtc_client.start()
 
     def stop_webrtc_session(self):
-        if self.webrtc_client:
-            self.webrtc_client.stop()
-            self.player.set_state(Gst.State.PAUSED)
-            self.player.remove(self.webrtc_client.webrtc)
-            self.player.set_state(Gst.State.PLAYING)
+        if self.webrtc_bin:
+            # self.player.set_state(Gst.State.PAUSED)
+            self.tee_vc.unlink(self.webrtc_bin)
+            self.player.remove(self.webrtc_bin)
+            # self.player.set_state(Gst.State.PLAYING)
+            try:
+                self.webrtc_client.shutdown()
+            except Exception:
+                pass
+        self.webrtc_bin = None
         self.webrtc_client = None
 
 
