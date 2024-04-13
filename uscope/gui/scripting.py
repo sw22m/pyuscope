@@ -428,18 +428,12 @@ class ArgusScriptingPlugin(QThread):
         """
         self.check_running()
         return version.get_meta()
-    
-    def start_webrtc_session(self, peer_id):
-        """
-        Request pipeline 
-        """
-        self._ac.vidpip.start_webrtc_session(peer_id)
 
-    def stop_webrtc_session(self):
+    def enable_udp_sink(self):
         """
-        Stops the webrtc client
+        Attach UDP sink to pipeline
         """
-        self._ac.vidpip.stop_webrtc_session()
+        self._ac.vidpip.enable_udp_sink()
 
     """
     Advanced API

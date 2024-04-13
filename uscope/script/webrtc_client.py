@@ -1,7 +1,6 @@
 """
 
 """
-from PyQt5.QtCore import pyqtSignal
 import random
 import websockets
 import asyncio
@@ -9,7 +8,7 @@ import json
 import gi
 import ssl
 import time
-from threading import Thread
+from threading import Thread, Event
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 gi.require_version('GstWebRTC', '1.0')
@@ -19,11 +18,17 @@ from gi.repository import GstSdp
 
 STUN_SERVER = "stun://stun.l.google.com:19302"
 
+
+ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+localhost_pem = "uscope/script/assets/localhost.pem"
+ssl_context.load_verify_locations(localhost_pem)
+
 Gst.init(None)
 
 
-class MyWebRtcBin(Gst.Bin):
+class WebRtcPipe(Gst.Pipeline):
 
+    port = 8554
     def __init__(
         self,
         gst_element_name=None,
@@ -33,9 +38,11 @@ class MyWebRtcBin(Gst.Bin):
 
         # self.player = player
         self.gst_element_name = gst_element_name
+
+        self.updsrc = None
+        self.videocrop = None
         # Used to fit incoming stream to window
         self.videoscale = None
-        self.videocrop = None
         # Tell the videoscale the window size we need
         self.capsfilter = None
         #
@@ -46,119 +53,97 @@ class MyWebRtcBin(Gst.Bin):
         self.openh264enc = None
         self.h264parse = None
         self.rtph264pay = None
-        self.webrtc = None
 
     def create_elements(self):
-        self.videocrop = Gst.ElementFactory.make("videocrop")
-        assert self.videocrop
-        self.add(self.videocrop)
+        self.udpsrc = Gst.ElementFactory.make("udpsrc")
+        assert self.udpsrc
+        self.udpsrc.set_property("name", "pay0")
+        self.udpsrc.set_property("port", self.port)
 
-        self.videoscale = Gst.ElementFactory.make("videoscale")
-        assert self.videoscale
-        self.add(self.videoscale)
+        def create_caps():
+            caps = Gst.Caps.new_empty_simple("application/x-rtp")
+            caps.set_value("media", "video")
+            caps.set_value("buffer-size", 524288)
+            caps.set_value("clock-rate", 90000)
+            caps.set_value("encoding-name", "H264")
+            caps.set_value("payload", 96)
+            return caps
 
-        # Use hardware acceleration if present
-        # Otherwise can soft flip feeds when / if needed
-        # videoflip_method = self.parent.usc.imager.videoflip_method()
-        # videoflip_method = self.ac.microscope.usc.imager.videoflip_method()
-        videoflip_method = False
-        if videoflip_method:
-            self.videoflip = Gst.ElementFactory.make("videoflip")
-            assert self.videoflip
-            self.videoflip.set_property("method", videoflip_method)
-            self.add(self.videoflip)
+        self.udpsrc.set_property("caps", create_caps())
+        self.add(self.udpsrc)
 
         self.capsfilter = Gst.ElementFactory.make("capsfilter")
         self.add(self.capsfilter)
 
-        self.videoconvert = Gst.ElementFactory.make("videoconvert")
-        self.add(self.videoconvert)
+        # self.openh264enc = Gst.ElementFactory.make("openh264enc")
+        # assert self.openh264enc
+        # self.add(self.openh264enc)
 
-        self.openh264enc = Gst.ElementFactory.make("openh264enc")
-        assert self.openh264enc
-        self.add(self.openh264enc)
-        self.h264parse = Gst.ElementFactory.make("h264parse")
-        assert self.h264parse
-        self.add(self.h264parse)
+        # self.h264parse = Gst.ElementFactory.make("h264parse")
+        # assert self.h264parse
+        # self.add(self.h264parse)
 
+        self.rtph264depay = Gst.ElementFactory.make("rtph264depay")
+        assert self.rtph264depay
+        self.add(self.rtph264depay)
+    
         self.rtph264pay = Gst.ElementFactory.make("rtph264pay")
         assert self.rtph264pay
-        # self.rtph264pay.set_property("name", "pay0")
-        self.rtph264pay.set_property("pt", 96) # or 97?
-        # self.rtph264pay.set_property("config-interval", 1)
+        self.rtph264pay.set_property("pt", 96)
+        self.rtph264pay.set_property("config-interval", 1)
         self.add(self.rtph264pay)
 
-        self.webrtc = Gst.ElementFactory.make("webrtcbin")
-        assert self.webrtc
-        self.add(self.webrtc)
-
-        # Link videocrop's sink to the bin's sink
-        bin_sink_pad = Gst.GhostPad.new("sink",
-                                        self.videocrop.get_static_pad("sink"))
-        bin_sink_pad.set_active(True)
-        self.add_pad(bin_sink_pad)
+        self.queue = Gst.ElementFactory.make("queue")
+        self.add(self.queue)
 
     def gst_link(self):
-        if self.videoflip:
-            assert self.videocrop.link(self.videoflip)
-            assert self.videoflip.link(self.videoscale)
-        else:
-            assert self.videocrop.link(self.videoscale)
-
-        assert self.videoscale.link(self.capsfilter)
-        assert self.capsfilter.link(self.videoconvert)
-        assert self.videoconvert.link(self.openh264enc)
-        assert self.openh264enc.link(self.h264parse)
-        assert self.h264parse.link(self.rtph264pay)
-        assert self.rtph264pay.link(self.webrtc)
+        assert self.udpsrc.link(self.capsfilter)
+        assert self.capsfilter.link(self.rtph264depay)
+        # assert self.openh264enc.link(self.h264parse)
+        # assert self.h264parse.link(self.rtph264depay)
+        assert self.rtph264depay.link(self.rtph264pay)
+        assert self.rtph264pay.link(self.queue)
 
 
 class WebRTCClient(Thread):
 
-    def __init__(self, peer_id, binReadycb):
+    def __init__(self):
         super().__init__()
         self._id = random.randrange(10, 10000)
-        self.binReadycb = binReadycb
+        self._connections = {}
+        self._conn_requests = set()
         self.loop = asyncio.new_event_loop()
-        self.ws = None
         self.pipe = None
-        self.webrtc = None
-        self.peer_id = peer_id
+        self.ws = None
         server = "wss://127.0.0.1:8443"
         self.server = server or STUN_SERVER
-        self.sslctx = False
-        if self.server.startswith(('wss://', 'https://')):
-            self.sslctx = ssl.create_default_context()
-            self.sslctx.check_hostname = False
-            self.sslctx.verify_mode = ssl.CERT_NONE
 
-    def connect_to_peer(self, peer_id):
-        """Establish new connection with peer"""
-        self.peer_id = peer_id
-
-    def run(self) -> None:
-        while True:
-            if self.peer_id is not None:
-                try:
-                    print(f"WebRTC connecting to {self.peer_id}")
-                    self._id = random.randrange(10, 10000)
-                    self.loop.run_until_complete(self.init_connection())
-                    self.loop.run_until_complete(self.message_handler())
-                except websockets.ConnectionClosed as e:
-                    self.peer_id = None
-                except Exception as e:
-                    self.peer_id = None
-                if not self.loop:
-                    break
+    def run(self):
+        self.stopEvent = Event()
+        self.stopEvent.set()
+        self.loop.run_until_complete(self.connect())
+        while self.stopEvent.is_set():
+            
             time.sleep(1)
 
-    async def init_connection(self):
-        self.ws = await websockets.connect(self.server, ssl=self.sslctx)
-        print("Webrtc Client Init myId:", self._id)
-        await self.ws.send(f'HELLO {self._id}')
+    async def connect(self):
+        async with websockets.connect(self.server, ssl=ssl_context) as self.ws:
+            await self.ws.send(f'HELLO {self._id}') # Register with server
+            self.loop.create_task(self.connection_handler())
+            while True:
+                # For any peer request, establish a session
+                if self._conn_requests:
+                    peer_id = self._conn_requests.pop()
+                    if peer_id:
+                        self.loop.create_task(self.setup_call(peer_id))
+                await asyncio.sleep(1)
 
-    async def setup_call(self):
-        await self.ws.send(f'SESSION {self.peer_id}')
+    def add_peer_connection(self, peer_id):
+        """Establish WebRTC session with peer"""
+        self._conn_requests.add(peer_id)
+
+    async def setup_call(self, peer_id):
+        await self.ws.send(f'SESSION {peer_id}')
 
     def send_sdp_offer(self, offer):
         text = offer.sdp.as_text()
@@ -203,60 +188,45 @@ class WebRTCClient(Thread):
             pad.link(q.get_static_pad('sink'))
             q.link(conv)
             conv.link(sink)
-        elif name.startswith('audio'):
-            q = Gst.ElementFactory.make('queue')
-            conv = Gst.ElementFactory.make('audioconvert')
-            resample = Gst.ElementFactory.make('audioresample')
-            sink = Gst.ElementFactory.make('autoaudiosink')
-            self.pipe.add(q, conv, resample, sink)
-            self.pipe.sync_children_states()
-            pad.link(q.get_static_pad('sink'))
-            q.link(conv)
-            conv.link(resample)
-            resample.link(sink)
 
     def on_incoming_stream(self, _, pad):
         if pad.direction != Gst.PadDirection.SRC:
             return
-        # decodebin = Gst.ElementFactory.make('decodebin')
-        # # decodebin.connect('pad-added', self.on_incoming_decodebin_stream)
-        # self.pipe.add(decodebin)
-        # decodebin.sync_state_with_parent()
-        # self.webrtc.link(decodebin)
 
-    def init_webrtc_bin(self):
-        self.mywebrtc = MyWebRtcBin(gst_element_name="webrtcbin")
-        self.mywebrtc.create_elements()
-        self.mywebrtc.gst_link()
+    def init_webrtc_bin(self, peer_id):
+        if not self.pipe:
+            self.pipe = WebRtcPipe(gst_element_name="webrtc")
+            self.pipe.create_elements()
+            self.pipe.gst_link()
 
-        # Prepare WebRTCBin
-        self.webrtc = self.mywebrtc.webrtc
-        self.webrtc.set_property("stun-server", STUN_SERVER)
-        self.webrtc.set_property("bundle-policy", "max-bundle")
-        self.webrtc.connect('on-negotiation-needed', self.on_negotiation_needed)
-        self.webrtc.connect('on-ice-candidate', self.send_ice_candidate_message)
-        # self.webrtc.connect('pad-added', self.on_incoming_stream)
+        webrtcbin = Gst.ElementFactory.make("webrtcbin")
+        assert webrtcbin
+        self.pipe.add(webrtcbin)
+        webrtcbin.set_property("stun-server", STUN_SERVER)
+        webrtcbin.set_property("bundle-policy", "max-bundle")
+        webrtcbin.connect('on-negotiation-needed', self.on_negotiation_needed)
+        webrtcbin.connect('on-ice-candidate', self.send_ice_candidate_message)
+        # webrtcbin.connect('pad-added', self.on_incoming_stream)
 
         # Only want to send data, not receive
         caps = Gst.Caps.from_string("application/x-rtp,media=video,encoding-name=VP8,payload=96")
-        self.webrtc.emit('add-transceiver', GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY, caps)
-        trans = self.webrtc.emit('get-transceiver', 0)
+        webrtcbin.emit('add-transceiver', GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY, caps)
+        trans = webrtcbin.emit('get-transceiver', 0)
         trans.direction = GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY
 
-        self.binReadycb(self.mywebrtc)
+        self._connections[peer_id] = webrtcbin
+        print(self._connections)
+        self.pipe.add(webrtcbin)
+        self.pipe.queue.link(webrtcbin)
+        self.pipe.set_state(Gst.State.PLAYING)
 
     async def handle_sdp(self, message):
-        if not message:
-            return
         assert (self.webrtc)
         msg = json.loads(message)
         if 'sdp' in msg:
             sdp = msg['sdp']
             assert(sdp['type'] == 'answer')
             sdp = sdp['sdp']
-            # print("---")
-            # print('Received answer:\n%s' % sdp)
-            # print("Received answer")
             res, sdpmsg = GstSdp.SDPMessage.new()
             GstSdp.sdp_message_parse_buffer(bytes(sdp.encode()), sdpmsg)
             answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
@@ -269,39 +239,25 @@ class WebRTCClient(Thread):
             sdpmlineindex = ice['sdpMLineIndex']
             self.webrtc.emit('add-ice-candidate', sdpmlineindex, candidate)
 
-    async def message_handler(self):
+    async def connection_handler(self):
         assert self.ws
-        try:
-            async for message in self.ws:
-                if message == 'HELLO':
-                    await self.setup_call()
-                elif message == 'SESSION_OK':
-                    self.init_webrtc_bin()
-                elif message.startswith('ERROR'):
-                    # raise Exception(message)
-                    break # TODO = keep alive or continue
-                else:
-                    await self.handle_sdp(message)
-        except Exception as e:
-            self.shutdown()
-            raise Exception(e)
+        async for msg in self.ws:
+            if msg is None:
+                break
+            if msg == 'HELLO':
+                pass  # Registered
+                # await self.setup_call()
+            elif msg.startswith('SESSION_OK'):
+                _, peer_id = msg.split(maxsplit=1)
+                # print(f"Session established with %peer_id")
+                self.init_webrtc_bin(peer_id)
+            elif msg.startswith('ERROR'):
+                self.peer_id = None
+                pass
+            else:
+                await self.handle_sdp(msg)
 
-    # async def stop(self):
-    #     try:
-    #         await self.ws.close(1000)
-    #     except Exception as e:
-    #         self.ws = None
-    #     self.peer_id = None
-
-    def shutdown(self):
+    def shutdown(self, cb=None):
+        self.stopEvent.clear()
+        self.peer_id = None
         self.loop.stop()
-        self.loop = None
-
-def check_plugins():
-    needed = ["opus", "vpx", "webrtc", "dtls", "srtp", "rtp",
-              "rtpmanager", "videotestsrc", "audiotestsrc"]  # removed nice
-    missing = list(filter(lambda p: Gst.Registry.get().find_plugin(p) is None, needed))
-    if len(missing):
-        print('Missing gstreamer plugins:', missing)
-        return False
-    return True

@@ -42,6 +42,7 @@ $ curl -X POST 'http://localhost:8080/set/pos/?y=1&x=-1&relative=1'; echo
 from uscope.gui.scripting import ArgusScriptingPlugin
 from uscope.script import webserver_common
 
+import ssl
 from flask import Flask, request, current_app, render_template, send_from_directory
 from werkzeug.serving import make_server
 from flask_cors import CORS
@@ -50,7 +51,7 @@ import base64
 import numpy as np
 import websockets
 from flask_sock import Sock
-import os
+from uscope.script.webrtc_client import WebRTCClient
 
 FLUTTER_WEB_DIR = "web"
 app = Flask(__name__, template_folder=FLUTTER_WEB_DIR)
@@ -65,7 +66,6 @@ def image_to_base64(p_img):
     frame = cv2.cvtColor(np.array(p_img), cv2.COLOR_RGB2BGR)
     img_encode = cv2.imencode('.jpg', frame)[1]
     string_data = base64.b64encode(img_encode).decode('utf-8')
-    # b64_src = 'data:image/jpeg;base64,'
     b64_src = ''
     return b64_src + string_data
 
@@ -205,6 +205,7 @@ def make_socket(sock):
                         current_app.plugin.log(f"room {room_id}: {uid} -> {other_id}: {msg}")
                         wso.send(msg)
                     elif msg == "ROOM_PEER_LIST":
+                        _, peer_id = msg.split(maxsplit=2)
                         room_id = sock.peers[peer_id][2]
                         room_peers = " ".join([pid for pid in sock.rooms[room_id] if pid != sock.peer_id])
                         msg = f"ROOM_PEER_LIST {room_peers}"
@@ -225,7 +226,7 @@ def make_socket(sock):
                 if peer_status is not None:
                     ws.send(f"ERROR peer {callee_id} busy")
                     continue
-                ws.send("SESSION_OK")
+                ws.send(f"SESSION_OK {callee_id}")
                 wsc = sock.peers[callee_id][0]
                 current_app.plugin.log(f"Session from peer {uid} ({raddr}) to peer {callee_id} ({get_remote_addr(wsc)})")
                 # Register session
@@ -241,12 +242,11 @@ def make_socket(sock):
                 if room_id == "session" or room_id.split() != [room_id]:
                     ws.send(f"ERROR invalid room id {room_id}")
                     continue
-                if room_id in sock.rooms:
-                    if uid in sock.rooms[room_id]:
-                        raise AssertionError("Should not receive ROOM command from member client")
-                else:
-                    # Create room if required
-                    sock.rooms[room_id] = set()
+                # Create room if it doesn't exist
+                sock.rooms.setdefault(room_id, set())
+                if uid in sock.rooms[room_id]:
+                    raise AssertionError("Should not receive ROOM command current member")
+
                 room_peers = " ".join([pid for pid in sock.rooms[room_id]])
                 ws.send(f"ROOM_OK {room_peers}")
                 # Enter room
@@ -269,6 +269,7 @@ class Plugin(ArgusScriptingPlugin):
         self.verbose = True
         self.frame = None
         self.socket = None
+        self.webrtc_client = None
 
     def log_verbose(self, msg):
         if self.verbose:
@@ -284,11 +285,15 @@ class Plugin(ArgusScriptingPlugin):
         app.plugin = self
 
         # Cert chain
-        cert_path = "uscope/script/assets/cert.pem"
-        cert_key_path = "uscope/script/assets/cert-key.pem"
-        if not os.path.exists(cert_path) or not os.path.exists(cert_key_path):
-            raise Warning("SSL Certificate not found required for WebRTC communication")
-        ssl_context=(cert_path, cert_key_path)
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # localhost_pem = pathlib.Path(__file__).with_name("assets/localhost.pem")
+        localhost_pem = "uscope/script/assets/localhost.pem"
+        ssl_context.load_cert_chain(localhost_pem)
+        # cert_path = "uscope/script/assets/cert.pem"
+        # cert_key_path = "uscope/script/assets/cert-key.pem"
+        # if not os.path.exists(cert_path) or not os.path.exists(cert_key_path):
+        #     raise Warning("SSL Certificate not found required for WebRTC communication")
+        # ssl_context=(cert_path, cert_key_path)
         self.server = make_server(host=HOST,
                                   port=SERVER_PORT,
                                   app=app,
@@ -299,11 +304,16 @@ class Plugin(ArgusScriptingPlugin):
         self.server.serve_forever(0.1)
 
     def shutdown(self):
-        app.plugin.stop_webrtc_session()
         self.server.shutdown()
         self.server.server_close()
         super().shutdown()
         self.server = None
+
+    def start_webrtc_session(self, peer_id):
+        if not self.webrtc_client:
+            self.webrtc_client = WebRTCClient()
+            self.webrtc_client.start()
+        self.webrtc_client.add_peer_connection(peer_id)
 
 
 webserver_common.make_app(app)
