@@ -310,6 +310,7 @@ class Plugin(ArgusScriptingPlugin):
         self.server = None
 
     def start_webrtc_session(self, peer_id):
+        self.enable_udp_sink()
         if not self.webrtc_client:
             self.webrtc_client = WebRTCClient()
             self.webrtc_client.start()
