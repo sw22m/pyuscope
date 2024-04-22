@@ -137,16 +137,14 @@ def make_socket(sock):
         #     print(request.environ["REMOTE_ADDR"])
         # else:
         #     print(request.environ["HTTP_X_FORWARDED_FOR"]) # if behind a proxy
-        raddr = get_remote_addr(ws)
-        # print(f"Connected to {raddr}")
         try:
             # Registered peer, now continue to listen
             connection_handler(ws, peer_id)
         except websockets.ConnectionClosed:
-            current_app.plugin.log("Connection to peer {raddr} closed, exiting handler")
+            raddr = get_remote_addr(ws)
+            current_app.plugin.log(f"Connection to peer {raddr} closed, exiting handler")
         except Exception as e:
             pass
-            # print(e)
         finally:
             sock.remove_peer(peer_id)
 
@@ -167,7 +165,6 @@ def make_socket(sock):
             ws.send("HELLO")  # Acknowledge the peer
             return uid
         except websockets.ConnectionClosed as e:
-            # print("A client just disconnected")
             ws.close()
         return None
 
@@ -246,7 +243,6 @@ def make_socket(sock):
                 sock.rooms.setdefault(room_id, set())
                 if uid in sock.rooms[room_id]:
                     raise AssertionError("Should not receive ROOM command current member")
-
                 room_peers = " ".join([pid for pid in sock.rooms[room_id]])
                 ws.send(f"ROOM_OK {room_peers}")
                 # Enter room
@@ -304,6 +300,9 @@ class Plugin(ArgusScriptingPlugin):
         self.server.serve_forever(0.1)
 
     def shutdown(self):
+        if self.webrtc_client:
+            self.webrtc_client.shutdown()
+            self.webrtc_client = None
         self.server.shutdown()
         self.server.server_close()
         super().shutdown()

@@ -18,7 +18,6 @@ from gi.repository import GstSdp
 
 STUN_SERVER = "stun://stun.l.google.com:19302"
 
-
 ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 localhost_pem = "uscope/script/assets/localhost.pem"
 ssl_context.load_verify_locations(localhost_pem)
@@ -83,9 +82,6 @@ class WebRtcPipe(Gst.Pipeline):
         self.rtph264pay.set_property("pt", 96)
         self.rtph264pay.set_property("config-interval", 1)
 
-        # self.rtpjitterbuffer = Gst.ElementFactory.make("rtpjitterbuffer")
-        # assert self.rtpjitterbuffer
-        # self.add(self.rtpjitterbuffer)
         self.queue2 = Gst.ElementFactory.make("queue")
         self.add(self.queue2)
 
@@ -94,9 +90,6 @@ class WebRtcPipe(Gst.Pipeline):
         assert self.rtpjitterbuffer.link(self.rtph264depay)
         assert self.rtph264depay.link(self.h264parse)
         assert self.h264parse.link(self.rtph264pay)
-        # assert self.rtph264depay.link(self.h264enc)
-        # assert self.h264parse.link(self.rtpjitterbuffer)
-        pass
 
     def add_webrtcbin(self, webrtcbin):
         queue = Gst.ElementFactory.make("queue")
@@ -105,28 +98,15 @@ class WebRtcPipe(Gst.Pipeline):
         self.add(webrtcbin)
         assert queue.link(webrtcbin)
 
-        return
-        queue = Gst.ElementFactory.make("queue")
-        try:
-            self.add(queue)
-            assert self.tee.link(queue)
-        except:
-            pass
-
-        try:
-            self.add(bin)
-            assert queue.link(bin)
-        except:
-            raise
-
 
 class WebRtcBin:
 
-    def __init__(self, ws, peer_id):
+    def __init__(self, event_loop, ws, peer_id):
+        self.event_loop = event_loop
         self.ws = ws
         self.peer_id = peer_id
         self.bin = Gst.ElementFactory.make("webrtcbin")
-        # self.bin.set_property("stun-server", STUN_SERVER)
+        self.bin.set_property("stun-server", STUN_SERVER)
         self.bin.set_property("bundle-policy", "max-bundle")
         self.bin.connect('on-negotiation-needed', self.on_negotiation_needed)
         self.bin.connect('on-ice-candidate', self.send_ice_candidate_message)
@@ -144,13 +124,20 @@ class WebRtcBin:
         trans = self.bin.emit('get-transceiver', 0)
         trans.direction = GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY
 
-    def send_sdp_offer(self, offer):
+    def send_soon(self, msg):
+        asyncio.run_coroutine_threadsafe(self.ws.send(msg), self.event_loop)
+
+    def send_sdp(self, offer):
         text = offer.sdp.as_text()
-        # print('Sending offer:\n%s' % text)
-        # print("Sending offer...")
-        msg = json.dumps({'sdp': {'type': 'offer', 'sdp': text}})
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(self.ws.send(msg))
+        if offer.type == GstWebRTC.WebRTCSDPType.OFFER:
+            # print('Sending offer:\n%s' % text)
+            msg = json.dumps({'sdp': {'type': 'offer', 'sdp': text}})
+        elif offer.type == GstWebRTC.WebRTCSDPType.ANSWER:
+            # print('Sending answer:\n%s' % text)
+            msg = json.dumps({'sdp': {'type': 'answer', 'sdp': text}})
+        else:
+            raise AssertionError(offer.type)
+        self.send_soon(msg)
 
     def on_offer_created(self, promise, _, __):
         promise.wait()
@@ -159,7 +146,7 @@ class WebRtcBin:
         promise = Gst.Promise.new()
         self.bin.emit('set-local-description', offer, promise)
         promise.interrupt()
-        self.send_sdp_offer(offer)
+        self.send_sdp(offer)
 
     def on_negotiation_needed(self, element):
         promise = Gst.Promise.new_with_change_func(self.on_offer_created, element, None)
@@ -167,18 +154,18 @@ class WebRtcBin:
 
     def send_ice_candidate_message(self, _, mlineindex, candidate):
         icemsg = json.dumps({'ice': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(self.ws.send(icemsg))
+        self.send_soon(icemsg)
     
     async def handle_sdp(self, message):
-        print(message, 2212122)
-        assert (self.bin)
-        msg = json.loads(message)
+        try:
+            msg = json.loads(message)
+        except Exception as e:
+            return
         if 'sdp' in msg:
             sdp = msg['sdp']
             assert(sdp['type'] == 'answer')
             sdp = sdp['sdp']
-            res, sdpmsg = GstSdp.SDPMessage.new()
+            _, sdpmsg = GstSdp.SDPMessage.new()
             GstSdp.sdp_message_parse_buffer(bytes(sdp.encode()), sdpmsg)
             answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
             promise = Gst.Promise.new()
@@ -197,8 +184,7 @@ class WebRTCClient(Thread):
         super().__init__()
         self._id = random.randrange(10, 10000)
         self._connections = {}
-        self._conn_requests = set()
-        self.loop = asyncio.new_event_loop()
+        self.event_loop = asyncio.new_event_loop()
         self.pipe = None
         self.ws = None
         server = "wss://127.0.0.1:8443"
@@ -206,29 +192,48 @@ class WebRTCClient(Thread):
 
     def run(self):
         self.stopEvent = Event()
-        self.stopEvent.set()
-        self.loop.run_until_complete(self.connect())
-        while self.stopEvent.is_set():
-            time.sleep(1)
+        while not self.stopEvent.is_set():
+            time.sleep(0.5)
+        self.close_pipeline()
+        self.event_loop.stop()
 
-    async def connect(self):
+    async def connect(self, peer_id):
         async with websockets.connect(self.server, ssl=ssl_context) as self.ws:
             await self.ws.send(f'HELLO {self._id}') # Register with server
-            self.loop.create_task(self.connection_handler())
-            while True:
-                # For any peer request, establish a session
-                if self._conn_requests:
-                    peer_id = self._conn_requests.pop()
-                    if peer_id:
-                        self.loop.create_task(self.setup_call(peer_id))
-                await asyncio.sleep(1)
+            self.event_loop.create_task(self.connection_handler())
+            self.event_loop.create_task(self.setup_call(peer_id))
+            while self.ws.open:
+                await asyncio.sleep(0.1)
+            self.ws = None
 
     def add_peer_connection(self, peer_id):
         """Establish WebRTC session with peer"""
-        self._conn_requests.add(peer_id)
+        if self.ws is None or not self.ws.open:
+            self.event_loop.run_until_complete(self.connect(peer_id))
 
     async def setup_call(self, peer_id):
+        # print(f'SESSION {peer_id}')
         await self.ws.send(f'SESSION {peer_id}')
+    
+    def send_soon(self, msg):
+        asyncio.run_coroutine_threadsafe(self.send(msg), self.event_loop)
+
+    def on_bus_poll_cb(self, bus):
+        def remove_bus_poll():
+            self.event_loop.remove_reader(bus.get_pollfd().fd)
+            self.event_loop.stop()
+        while bus.peek():
+            msg = bus.pop()
+            if msg.type == Gst.MessageType.ERROR:
+                err = msg.parse_error()
+                # print("ERROR:", err.gerror, err.debug)
+                remove_bus_poll()
+                break
+            elif msg.type == Gst.MessageType.EOS:
+                remove_bus_poll()
+                break
+            elif msg.type == Gst.MessageType.LATENCY:
+                self.pipe.recalculate_latency()
 
     def init_webrtc_bin(self, peer_id):
         if not self.pipe:
@@ -236,34 +241,42 @@ class WebRTCClient(Thread):
             self.pipe.create_elements()
             self.pipe.gst_link()
 
-        webrtcbin = WebRtcBin(self.ws, peer_id)
+        webrtcbin = WebRtcBin(self.event_loop, self.ws, peer_id)
         assert webrtcbin.bin
 
         self._connections[peer_id] = webrtcbin
         self.pipe.add_webrtcbin(webrtcbin.bin)
         self.webrtcbin = webrtcbin
+        bus = self.pipe.get_bus()
+        self.event_loop.add_reader(bus.get_pollfd().fd, self.on_bus_poll_cb, bus)
         self.pipe.set_state(Gst.State.PLAYING)
-    
+
     async def connection_handler(self):
         assert self.ws
         async for msg in self.ws:
-            print(msg)
             if msg is None:
                 break
             if msg == 'HELLO':
                 pass  # Registered
-                # await self.setup_call()
             elif msg.startswith('SESSION_OK'):
                 _, peer_id = msg.split(maxsplit=1)
                 # print(f"Session established with %peer_id")
                 self.init_webrtc_bin(peer_id)
             elif msg.startswith('ERROR'):
-                self.peer_id = None
-                pass
+                self.close_pipeline()
+                return 1
             else:
                 await self.webrtcbin.handle_sdp(msg)
+        self.close_pipeline()
 
-    def shutdown(self, cb=None):
-        self.stopEvent.clear()
-        self.peer_id = None
-        self.loop.stop()
+    def shutdown(self):
+        self.stopEvent.set()
+        while self.event_loop.is_running():
+            time.sleep(0.1)
+            continue
+
+    def close_pipeline(self):
+        if self.pipe:
+            self.pipe.set_state(Gst.State.NULL)
+            self.pipe = None
+        self.webrtcbin = None
