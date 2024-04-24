@@ -65,7 +65,7 @@ def make_app(app):
     @app.route('/get/system_status', methods=['GET'])
     @except_wrap
     def system_status():
-        system_status = plucurrent_app.pluginin.system_status()
+        system_status = current_app.pluginin.system_status()
         return {
             'data': system_status,
             'status': HTTPStatus.OK,
